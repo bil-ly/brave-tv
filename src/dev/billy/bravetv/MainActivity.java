@@ -8,31 +8,41 @@ import android.graphics.*;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.*;
+import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.*;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.*;
 import android.widget.*;
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Brave TV — Native Android TV YouTube & Web experience.
- * - Uses YouTube TV's native D-pad interface (https://www.youtube.com/tv) with Smart-TV User-Agent
- *   so your TV remote works 100% natively (Up/Down/Left/Right/OK/Back — no mouse pointer needed!).
- * - Uses Brave/uBlock-style JSON.parse & network interception to strip `adPlacements`, `playerAds`,
- *   and `adSlots` before the player ever sees an ad, plus instant video ad skip fallback.
- * - Press MENU (or long-press BACK) anytime to switch between YouTube TV and full Web Browser mode.
+ * Brave TV — Native Android TV YouTube, Live Soccer/Sports Hub & Web experience.
+ * - Uses YouTube TV's native D-pad interface (https://www.youtube.com/tv) with Smart-TV User-Agent.
+ * - Integrates Live Sports directly from https://t.me/s/totalsporteki:
+ *   scrapes live match cards + stream servers in background and launches streams in a 16:9 Cinema
+ *   Isolator with aggressive popup/ad-script/overlay killing.
+ * - Press MENU (or long-press BACK) anytime to switch between YouTube TV, Live Sports, and Web mode.
  */
 public final class MainActivity extends Activity {
-    // Smart TV User-Agent unlocks the real D-pad YouTube TV app interface at youtube.com/tv
     private static final String SMART_TV_UA =
         "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 TV Safari/537.36";
     private static final String DESKTOP_UA =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Brave/131";
     private static final String YT_TV_URL = "https://www.youtube.com/tv";
+    private static final String TELEGRAM_CHANNEL_URL = "https://t.me/s/totalsporteki";
 
     private SharedPreferences prefs;
     private float unit = 1f;
@@ -44,14 +54,24 @@ public final class MainActivity extends Activity {
     private WebChromeClient.CustomViewCallback customVideoCallback;
     private ProgressBar progressBar;
 
-    // Top bar overlay (opened with MENU or from web mode)
+    // Top bar overlay (opened with MENU or long-press BACK)
     private FrameLayout topBarCard;
     private LinearLayout topBarRow1, topBarRow2;
     private EditText urlInput;
     private TextView shieldBtn, modeBtn;
     private boolean barVisible = false;
 
-    // Cursor only used when browsing normal desktop websites (automatically hidden on YouTube TV!)
+    // Native Live Sports Hub Overlay (D-pad driven, scrapes t.me/s/totalsporteki & sportslinks.is)
+    private FrameLayout sportsOverlay;
+    private LinearLayout matchesListContainer;
+    private LinearLayout serversListContainer;
+    private TextView sportsStatusText;
+    private TextView serversHeaderText;
+    private boolean sportsVisible = false;
+    private boolean inSportsStreamMode = false;
+    private final ExecutorService bgExecutor = Executors.newCachedThreadPool();
+
+    // Cursor only used when browsing normal desktop websites (hidden on YouTube TV)
     private CursorView cursorView;
     private float cursorX, cursorY;
     private boolean shieldsEnabled = true;
@@ -59,12 +79,34 @@ public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private long lastBackPress = 0;
 
+    private static final class MatchItem {
+        final String competition;
+        final String title;
+        final String timeInfo;
+        final String link;
+        MatchItem(String competition, String title, String timeInfo, String link) {
+            this.competition = competition;
+            this.title = title;
+            this.timeInfo = timeInfo;
+            this.link = link;
+        }
+    }
+
+    private static final class ServerItem {
+        final String name;
+        final String url;
+        ServerItem(String name, String url) {
+            this.name = name;
+            this.url = url;
+        }
+    }
+
     private static final String[][] QUICK_SITES = {
         {"▶ YouTube TV", "https://www.youtube.com/tv", "#FF0033"},
+        {"⚽ Live Soccer", "brave://sports", "#10B981"},
         {"🦁 Brave Search", "https://search.brave.com", "#FB542B"},
         {"HiAnime", "https://hianime.to", "#FFBADE"},
         {"Twitch", "https://www.twitch.tv", "#9146FF"},
-        {"Reddit", "https://www.reddit.com", "#FF4500"},
         {"GitHub", "https://github.com/bil-ly", "#2B3137"}
     };
 
@@ -76,14 +118,26 @@ public final class MainActivity extends Activity {
         "popads.net", "popcash.net", "propellerads.com", "exoclick.com", "juicyads.com",
         "trafficjunky.net", "adsterra.com", "hilltopads.net", "clickadu.com", "bidvertiser.com",
         "revcontent.com", "mgid.com", "zedo.com", "scorecardresearch.com", "quantserve.com",
-        "moatads.com", "2mdn.net", "admob.com", "adroll.com"
+        "moatads.com", "2mdn.net", "admob.com", "adroll.com",
+        // Sports stream ad/popup networks found on totalsportek / sportslinks servers
+        "czernik.org", "capitalhospitals.org", "thirstacock.com", "livelog.site",
+        "arcadiablankdenying.com", "histats.com", "acscdn.com", "usrpubtrk.com",
+        "onclickalgo.com", "onclckmn.com", "wpadmngr.com", "tsyndicate.com",
+        "bidgear.com", "galaksion.com", "pushame.com", "pushwhy.com", "rtmark.net",
+        "adcash.com", "alfadart.com", "bet365.com", "1xbet.com", "stake.com"
     };
 
-    // Brave / uBlock style ad-stripping script injected into YouTube TV & web pages
+    // Brave / uBlock style ad-stripping + sports stream popup/overlay killer + 16:9 Cinema Isolator
     private static final String BRAVE_YT_SHIELD_JS =
         "(function(){" +
         "if(window.__braveYtShieldInstalled)return;" +
         "window.__braveYtShieldInstalled=true;" +
+        // 1. Neutralize popup/redirect functions used by sports streaming sites
+        "window.open=function(){return null;};" +
+        "window.alert=function(){};window.confirm=function(){return false;};window.prompt=function(){return null;};" +
+        "window.aclib={runPop:function(){},runBanner:function(){},runAutoTag:function(){},runInPagePush:function(){}};" +
+        "try{Object.defineProperty(window,'atOptions',{get:function(){return {};},set:function(){}});}catch(e){}" +
+        // 2. Strip YouTube JSON ad payloads
         "function stripAds(obj){" +
         "  if(!obj||typeof obj!=='object')return obj;" +
         "  delete obj.adPlacements;delete obj.playerAds;delete obj.adSlots;delete obj.adBreakHeartbeatParams;" +
@@ -96,15 +150,38 @@ public final class MainActivity extends Activity {
         "  const origJson=Response.prototype.json;" +
         "  Response.prototype.json=function(){return origJson.apply(this,arguments).then(stripAds);};" +
         "}" +
+        // 3. Periodic YouTube ad skip + Sports stream invisible click-hijack overlay killer
         "setInterval(function(){" +
         "  var skip=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,[class*=\"skip-button\"]');" +
         "  if(skip){try{skip.click();}catch(e){}}" +
         "  var adPlayer=document.querySelector('.ad-showing video, .ad-interrupting video');" +
         "  if(adPlayer&&!isNaN(adPlayer.duration)&&adPlayer.duration>0){adPlayer.muted=true;adPlayer.currentTime=adPlayer.duration;}" +
-        "},250);" +
+        "  if(!location.hostname.includes('youtube.com')){" +
+        "    var els=document.querySelectorAll('div,a,ins,aside');" +
+        "    for(var i=0;i<els.length;i++){" +
+        "      var el=els[i];" +
+        "      var st=window.getComputedStyle(el);" +
+        "      var z=parseInt(st.zIndex,10)||0;" +
+        "      if((st.position==='fixed'||st.position==='absolute')&&z>900&&!el.querySelector('video,iframe')){" +
+        "        el.remove();" +
+        "      }" +
+        "    }" +
+        "  }" +
+        "},300);" +
         "var st=document.createElement('style');" +
-        "st.textContent='ytlr-ad-placement-renderer,ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ytd-banner-promo-renderer,.ytp-ad-overlay-container,.ytp-ad-message-container,iframe[src*=\"doubleclick\"]{display:none!important;} video::-webkit-media-controls,video::-webkit-media-controls-enclosure,video::-webkit-media-controls-panel,video::-webkit-media-controls-overlay-play-button{display:none!important;opacity:0!important;}';" +
+        "st.textContent='ytlr-ad-placement-renderer,ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ytd-banner-promo-renderer,.ytp-ad-overlay-container,.ytp-ad-message-container,.ad-header,.ad-box,.top-nav,.footer,[class*=\"ad-banner\"],[id*=\"ad-container\"],iframe[src*=\"doubleclick\"],iframe[src*=\"histats\"],iframe[src*=\"czernik\"]{display:none!important;} video::-webkit-media-controls,video::-webkit-media-controls-enclosure,video::-webkit-media-controls-panel,video::-webkit-media-controls-overlay-play-button{display:none!important;opacity:0!important;}';" +
         "if(document.documentElement)document.documentElement.appendChild(st);" +
+        "})();";
+
+    // When watching a sports stream server, isolate the video/player container into full-screen 16:9 dark cinema
+    private static final String SPORTS_CINEMA_ISOLATOR_JS =
+        "(function(){" +
+        "if(location.hostname.includes('youtube.com'))return;" +
+        "var st=document.getElementById('brave-sports-cinema');" +
+        "if(!st){st=document.createElement('style');st.id='brave-sports-cinema';document.head&&document.head.appendChild(st);}" +
+        "st.textContent='html,body{background:#000!important;color:#fff!important;margin:0!important;padding:0!important;overflow:hidden!important;} .top-nav,.ad-header,.ad-box,.footer,header,nav,footer,aside,.chat,.sidebar{display:none!important;} .player-container,.player-wrap,#pw{max-width:100vw!important;width:100vw!important;height:100vh!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;background:#000!important;}';" +
+        "var v=document.querySelector('video');" +
+        "if(v){v.muted=false;try{v.play();}catch(e){}}" +
         "})();";
 
     private int px(float v) { return Math.round(v * unit); }
@@ -145,6 +222,7 @@ public final class MainActivity extends Activity {
         createWebView();
         createProgressBar();
         createCursor();
+        createSportsOverlay();
         createTopBar();
 
         fullscreenContainer = new FrameLayout(this);
@@ -214,7 +292,15 @@ public final class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                 if (req == null || req.getUrl() == null) return false;
                 String url = req.getUrl().toString();
-                return !(url.startsWith("http://") || url.startsWith("https://"));
+                String host = req.getUrl().getHost() != null ? req.getUrl().getHost().toLowerCase(Locale.US) : "";
+                // Block non-HTTP intents and ad-redirect navigations
+                if (!(url.startsWith("http://") || url.startsWith("https://"))) return true;
+                if (shieldsEnabled && isBlockedUrl(host, url.toLowerCase(Locale.US))) {
+                    blockedCount.incrementAndGet();
+                    updateShieldPill();
+                    return true;
+                }
+                return false;
             }
 
             @Override
@@ -225,6 +311,7 @@ public final class MainActivity extends Activity {
                 if (shieldsEnabled) view.evaluateJavascript(BRAVE_YT_SHIELD_JS, null);
                 handler.postDelayed(() -> {
                     if (shieldsEnabled) view.evaluateJavascript(BRAVE_YT_SHIELD_JS, null);
+                    if (inSportsStreamMode) view.evaluateJavascript(SPORTS_CINEMA_ISOLATOR_JS, null);
                     injectViewportFit(url);
                 }, 150);
                 updateShieldPill();
@@ -235,6 +322,10 @@ public final class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 syncModeForUrl(url);
                 if (shieldsEnabled) view.evaluateJavascript(BRAVE_YT_SHIELD_JS, null);
+                if (inSportsStreamMode) {
+                    view.evaluateJavascript(SPORTS_CINEMA_ISOLATOR_JS, null);
+                    handler.postDelayed(() -> view.evaluateJavascript(SPORTS_CINEMA_ISOLATOR_JS, null), 1200);
+                }
                 injectViewportFit(url);
                 updateShieldPill();
             }
@@ -243,7 +334,7 @@ public final class MainActivity extends Activity {
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public Bitmap getDefaultVideoPoster() {
-                // Return a 1x1 transparent/black bitmap so Android WebView never shows the giant ugly grey play icon before a video starts
+                // Return a 1x1 transparent bitmap so Android WebView never flashes the giant grey play icon
                 return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
             }
 
@@ -259,7 +350,10 @@ public final class MainActivity extends Activity {
 
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                return false; // Block all popup windows
+                // Block all popup windows & tab-unders unconditionally
+                blockedCount.incrementAndGet();
+                updateShieldPill();
+                return false;
             }
 
             @Override
@@ -293,12 +387,12 @@ public final class MainActivity extends Activity {
     private void syncModeForUrl(String url) {
         boolean ytTv = url != null && (url.contains("youtube.com/tv") || url.contains("youtube.com/leanback"));
         if (cursorView != null) {
-            cursorView.setVisibility(ytTv ? View.GONE : View.VISIBLE);
+            cursorView.setVisibility((ytTv || sportsVisible) ? View.GONE : View.VISIBLE);
         }
         if (modeBtn != null) {
-            modeBtn.setText(ytTv ? "Mode: Native TV" : "Mode: Web Pointer");
+            modeBtn.setText(ytTv ? "Mode: Native TV" : (inSportsStreamMode ? "Mode: Sports Cinema" : "Mode: Web Pointer"));
         }
-        if (ytTv && !barVisible) {
+        if (ytTv && !barVisible && !sportsVisible) {
             webView.setFocusable(true);
             webView.setFocusableInTouchMode(true);
             webView.requestFocus();
@@ -311,12 +405,13 @@ public final class MainActivity extends Activity {
         }
         return fullUrl.contains("/pagead/") || fullUrl.contains("/ptracking") ||
                fullUrl.contains("/api/stats/ads") || fullUrl.contains("get_midroll_info") ||
-               fullUrl.contains("/adserver") || fullUrl.contains("popunder");
+               fullUrl.contains("/adserver") || fullUrl.contains("popunder") ||
+               fullUrl.contains("histats.com") || fullUrl.contains("aclib") ||
+               fullUrl.contains("ytr5541122hhgfdd.js");
     }
 
     private void injectViewportFit(String url) {
         if (webView == null || url == null) return;
-        // YouTube TV native interface handles its own 16:9 resolution natively
         if (url.contains("youtube.com/tv")) return;
         float scale = tvCssWidth / 1440f;
         String scaleStr = String.format(Locale.US, "%.4f", scale);
@@ -346,6 +441,353 @@ public final class MainActivity extends Activity {
         root.addView(cursorView, new FrameLayout.LayoutParams(-1, -1));
     }
 
+    // =========================================================================
+    // LIVE SOCCER / SPORTS HUB OVERLAY (Scrapes t.me/s/totalsporteki + servers)
+    // =========================================================================
+    private void createSportsOverlay() {
+        sportsOverlay = new FrameLayout(this);
+        sportsOverlay.setBackgroundColor(0xF40B0E16);
+        sportsOverlay.setVisibility(View.GONE);
+
+        LinearLayout mainCol = new LinearLayout(this);
+        mainCol.setOrientation(LinearLayout.VERTICAL);
+        mainCol.setPadding(px(36), px(28), px(36), px(28));
+
+        // Header Row
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView badge = new TextView(this);
+        badge.setText("⚽ TOTALSPORTEK LIVE");
+        badge.setTextColor(0xFF10B981);
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(18));
+        badge.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        header.addView(badge, marginRight(-2, -2, 16));
+
+        sportsStatusText = new TextView(this);
+        sportsStatusText.setText("Synced with t.me/totalsporteki · Zero Ads & Zero Popups");
+        sportsStatusText.setTextColor(0xAAFFFFFF);
+        sportsStatusText.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(13));
+        header.addView(sportsStatusText, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView refreshBtn = barButton("↻ Refresh Matches", 0xFF1E293B, this::fetchTelegramMatches);
+        header.addView(refreshBtn, marginRight(px(140), px(34), 10));
+
+        TextView closeBtn = barButton("✕ Back to Video", 0x26FFFFFF, this::hideSportsOverlay);
+        header.addView(closeBtn, new LinearLayout.LayoutParams(px(130), px(34)));
+
+        mainCol.addView(header, new LinearLayout.LayoutParams(-1, px(44)));
+
+        // Two-Column Body: Left = Live Matches from Telegram, Right = Clean Stream Servers
+        LinearLayout columns = new LinearLayout(this);
+        columns.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams colLp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        colLp.topMargin = px(16);
+
+        // Left Column (Matches)
+        LinearLayout leftBox = new LinearLayout(this);
+        leftBox.setOrientation(LinearLayout.VERTICAL);
+        leftBox.setBackground(shape(0xFF131824, 16, 0x22FFFFFF, 1));
+        leftBox.setPadding(px(16), px(14), px(16), px(14));
+
+        TextView leftTitle = new TextView(this);
+        leftTitle.setText("1. SELECT LIVE MATCH (FROM TELEGRAM)");
+        leftTitle.setTextColor(0x99FFFFFF);
+        leftTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11.5f));
+        leftTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        leftBox.addView(leftTitle, new LinearLayout.LayoutParams(-1, px(22)));
+
+        ScrollView matchScroll = new ScrollView(this);
+        matchScroll.setVerticalScrollBarEnabled(false);
+        matchesListContainer = new LinearLayout(this);
+        matchesListContainer.setOrientation(LinearLayout.VERTICAL);
+        matchScroll.addView(matchesListContainer, new FrameLayout.LayoutParams(-1, -2));
+        leftBox.addView(matchScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        LinearLayout.LayoutParams leftLp = new LinearLayout.LayoutParams(0, -1, 1.05f);
+        leftLp.rightMargin = px(16);
+        columns.addView(leftBox, leftLp);
+
+        // Right Column (Stream Servers)
+        LinearLayout rightBox = new LinearLayout(this);
+        rightBox.setOrientation(LinearLayout.VERTICAL);
+        rightBox.setBackground(shape(0xFF131824, 16, 0x22FFFFFF, 1));
+        rightBox.setPadding(px(16), px(14), px(16), px(14));
+
+        serversHeaderText = new TextView(this);
+        serversHeaderText.setText("2. SELECT AD-FREE STREAM SERVER");
+        serversHeaderText.setTextColor(0x99FFFFFF);
+        serversHeaderText.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11.5f));
+        serversHeaderText.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        rightBox.addView(serversHeaderText, new LinearLayout.LayoutParams(-1, px(22)));
+
+        ScrollView serverScroll = new ScrollView(this);
+        serverScroll.setVerticalScrollBarEnabled(false);
+        serversListContainer = new LinearLayout(this);
+        serversListContainer.setOrientation(LinearLayout.VERTICAL);
+        serverScroll.addView(serversListContainer, new FrameLayout.LayoutParams(-1, -2));
+        rightBox.addView(serverScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        columns.addView(rightBox, new LinearLayout.LayoutParams(0, -1, 1.15f));
+        mainCol.addView(columns, colLp);
+
+        sportsOverlay.addView(mainCol, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(sportsOverlay, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void showSportsOverlay() {
+        hideTopBar();
+        sportsVisible = true;
+        sportsOverlay.setVisibility(View.VISIBLE);
+        cursorView.setVisibility(View.GONE);
+        if (matchesListContainer.getChildCount() == 0) {
+            fetchTelegramMatches();
+        } else {
+            matchesListContainer.getChildAt(0).requestFocus();
+        }
+    }
+
+    private void hideSportsOverlay() {
+        sportsVisible = false;
+        sportsOverlay.setVisibility(View.GONE);
+        syncModeForUrl(webView.getUrl());
+    }
+
+    private void fetchTelegramMatches() {
+        sportsStatusText.setText("Fetching live matches from t.me/totalsporteki…");
+        matchesListContainer.removeAllViews();
+        bgExecutor.execute(() -> {
+            List<MatchItem> items = new ArrayList<>();
+            try {
+                String html = httpGet(TELEGRAM_CHANNEL_URL, null);
+                Pattern msgPat = Pattern.compile(
+                    "<div class=\"tgme_widget_message_text[^>]*>(.*?)</div>", Pattern.DOTALL);
+                Matcher m = msgPat.matcher(html);
+                while (m.find()) {
+                    String block = m.group(1);
+                    Matcher linkM = Pattern.compile("href=[\"'](https?://[^\"']+)[\"']").matcher(block);
+                    String matchUrl = null;
+                    while (linkM.find()) {
+                        String candidate = linkM.group(1);
+                        if (!candidate.contains("t.me/")) {
+                            matchUrl = candidate;
+                            break;
+                        }
+                    }
+                    if (matchUrl == null) continue;
+                    String text = block.replaceAll("<br\\s*/?>", "\n").replaceAll("<[^>]+>", "").trim();
+                    String[] lines = text.split("\n+");
+                    String comp = "LIVE MATCH";
+                    String title = matchUrl;
+                    String time = "Live Stream";
+                    List<String> nonEmpty = new ArrayList<>();
+                    for (String l : lines) {
+                        String t = l.trim();
+                        if (!t.isEmpty()) nonEmpty.add(t);
+                    }
+                    if (nonEmpty.size() >= 2) {
+                        comp = nonEmpty.get(0);
+                        title = nonEmpty.get(1);
+                    }
+                    for (String l : nonEmpty) {
+                        if (l.contains("GMT") || l.contains("Kickoff") || l.contains("🕐")) {
+                            time = l;
+                        }
+                    }
+                    items.add(new MatchItem(comp, title, time, matchUrl));
+                }
+                Collections.reverse(items);
+            } catch (Exception e) {
+                handler.post(() -> sportsStatusText.setText("Error fetching Telegram feed: " + e.getMessage()));
+                return;
+            }
+            handler.post(() -> {
+                matchesListContainer.removeAllViews();
+                if (items.isEmpty()) {
+                    sportsStatusText.setText("No active match links found right now on t.me/totalsporteki");
+                    return;
+                }
+                sportsStatusText.setText("Found " + items.size() + " live events on t.me/totalsporteki · Select a match");
+                for (int i = 0; i < items.size(); i++) {
+                    MatchItem item = items.get(i);
+                    View card = createMatchCard(item);
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+                    lp.topMargin = px(8);
+                    matchesListContainer.addView(card, lp);
+                    if (i == 0) {
+                        card.requestFocus();
+                        fetchMatchServers(item);
+                    }
+                }
+            });
+        });
+    }
+
+    private View createMatchCard(MatchItem item) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(px(14), px(10), px(14), px(10));
+        box.setFocusable(true);
+        box.setFocusableInTouchMode(true);
+
+        TextView comp = new TextView(this);
+        comp.setText(item.competition + "  ·  " + item.timeInfo);
+        comp.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11));
+        comp.setSingleLine(true);
+
+        TextView title = new TextView(this);
+        title.setText(item.title);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(15));
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        title.setSingleLine(true);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+
+        box.addView(comp);
+        box.addView(title);
+
+        Runnable paint = () -> {
+            boolean f = box.hasFocus();
+            box.setBackground(shape(f ? 0xFF10B981 : 0xFF1B2234, 12, f ? Color.WHITE : 0x22FFFFFF, f ? 2f : 1f));
+            comp.setTextColor(f ? 0xFF06281E : 0xFF10B981);
+            title.setTextColor(f ? 0xFF06281E : Color.WHITE);
+        };
+        paint.run();
+        box.setOnFocusChangeListener((v, f) -> paint.run());
+        box.setOnClickListener(v -> fetchMatchServers(item));
+        return box;
+    }
+
+    private void fetchMatchServers(MatchItem item) {
+        serversHeaderText.setText("LOADING SERVERS FOR: " + item.title);
+        serversListContainer.removeAllViews();
+        bgExecutor.execute(() -> {
+            List<ServerItem> servers = new ArrayList<>();
+            try {
+                String html = httpGet(item.link, "https://t.me/");
+                Pattern aPat = Pattern.compile(
+                    "<a[^>]+href=[\"'](https?://[^\"']+)[\"'][^>]*>(.*?)</a>",
+                    Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
+                Matcher m = aPat.matcher(html);
+                Set<String> seen = new HashSet<>();
+                while (m.find()) {
+                    String href = m.group(1).trim();
+                    if (href.contains("totalsportek.today") || href.contains("totalsportek24") ||
+                        href.contains("footybite") || href.contains("nbabite") ||
+                        href.contains("nflbite") || href.contains("sportsurge") ||
+                        href.contains("soccerstreams") || href.contains("hofoot") ||
+                        href.contains("twitter.com") || href.contains("t.me")) {
+                        continue;
+                    }
+                    if (!seen.add(href)) continue;
+                    String label = m.group(2).replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+                    if (label.isEmpty() || label.length() < 3) {
+                        label = Uri.parse(href).getHost();
+                    }
+                    servers.add(new ServerItem(label, href));
+                }
+            } catch (Exception e) {
+                handler.post(() -> serversHeaderText.setText("Failed to load servers: " + e.getMessage()));
+                return;
+            }
+            handler.post(() -> {
+                serversListContainer.removeAllViews();
+                if (servers.isEmpty()) {
+                    // Fallback: open the match page directly in Brave TV with shields active
+                    serversHeaderText.setText("DIRECT MATCH STREAM (" + item.title + ")");
+                    View directBtn = createServerCard(new ServerItem("▶ Open Match Page Directly (Shields ON)", item.link), 1);
+                    serversListContainer.addView(directBtn);
+                    return;
+                }
+                serversHeaderText.setText("2. PICK SERVER FOR " + item.title + " (" + servers.size() + " SERVERS)");
+                int idx = 1;
+                for (ServerItem srv : servers) {
+                    View card = createServerCard(srv, idx++);
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+                    lp.topMargin = px(7);
+                    serversListContainer.addView(card, lp);
+                }
+            });
+        });
+    }
+
+    private View createServerCard(ServerItem srv, int index) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(px(14), px(10), px(14), px(10));
+        row.setFocusable(true);
+        row.setFocusableInTouchMode(true);
+
+        TextView num = new TextView(this);
+        num.setText("SERVER #" + index);
+        num.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11.5f));
+        num.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        row.addView(num, marginRight(px(86), -2, 10));
+
+        TextView name = new TextView(this);
+        name.setText(srv.name);
+        name.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(13.5f));
+        name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        row.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        Runnable paint = () -> {
+            boolean f = row.hasFocus();
+            row.setBackground(shape(f ? Color.WHITE : 0xFF1B2234, 10, f ? 0xFF10B981 : 0x22FFFFFF, f ? 2f : 1f));
+            num.setTextColor(f ? 0xFF065F46 : 0xFF10B981);
+            name.setTextColor(f ? 0xFF111827 : Color.WHITE);
+        };
+        paint.run();
+        row.setOnFocusChangeListener((v, f) -> paint.run());
+        row.setOnClickListener(v -> launchCleanSportsServer(srv));
+        return row;
+    }
+
+    private void launchCleanSportsServer(ServerItem srv) {
+        inSportsStreamMode = true;
+        hideSportsOverlay();
+        sportsStatusText.setText("Playing: " + srv.name);
+        webView.getSettings().setUserAgentString(DESKTOP_UA);
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Referer", "http://sportslinks.is/");
+        syncModeForUrl(srv.url);
+        webView.loadUrl(srv.url, headers);
+    }
+
+    private String httpGet(String urlStr, String referer) throws Exception {
+        String current = urlStr;
+        for (int hop = 0; hop < 5; hop++) {
+            HttpURLConnection conn = (HttpURLConnection) new URL(current).openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setInstanceFollowRedirects(false);
+            conn.setRequestProperty("User-Agent", DESKTOP_UA);
+            if (referer != null) conn.setRequestProperty("Referer", referer);
+            int code = conn.getResponseCode();
+            if (code >= 300 && code < 400) {
+                String loc = conn.getHeaderField("Location");
+                conn.disconnect();
+                if (loc == null) break;
+                current = new URL(new URL(current), loc).toString();
+                continue;
+            }
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = br.readLine()) != null) {
+                    sb.append(line).append('\n');
+                }
+                return sb.toString();
+            }
+        }
+        throw new Exception("Too many redirects");
+    }
+
+    // =========================================================================
+    // TOP BAR & NAVIGATION
+    // =========================================================================
     private void createTopBar() {
         topBarCard = new FrameLayout(this);
         topBarCard.setBackground(shape(0xF212151E, 20, 0x33FFFFFF, 1));
@@ -361,12 +803,14 @@ public final class MainActivity extends Activity {
         row1.setGravity(Gravity.CENTER_VERTICAL);
 
         View ytBtn = barButton("▶ YouTube TV", 0xFFFF0033, () -> { loadTarget(YT_TV_URL); hideTopBar(); });
+        View sportsBtn = barButton("⚽ Live Soccer", 0xFF059669, this::showSportsOverlay);
         View backBtn = barButton("←", 0x26FFFFFF, () -> { if (webView.canGoBack()) webView.goBack(); hideTopBar(); });
         View reloadBtn = barButton("↻", 0x26FFFFFF, () -> { webView.reload(); hideTopBar(); });
 
-        row1.addView(ytBtn, marginRight(px(106), px(36), 6));
-        row1.addView(backBtn, marginRight(px(40), px(36), 6));
-        row1.addView(reloadBtn, marginRight(px(40), px(36), 8));
+        row1.addView(ytBtn, marginRight(px(102), px(36), 6));
+        row1.addView(sportsBtn, marginRight(px(108), px(36), 6));
+        row1.addView(backBtn, marginRight(px(38), px(36), 6));
+        row1.addView(reloadBtn, marginRight(px(38), px(36), 8));
 
         urlInput = new EditText(this);
         urlInput.setSingleLine(true);
@@ -406,7 +850,7 @@ public final class MainActivity extends Activity {
         });
         modeBtn = barButton("Mode: Native TV", 0x26FFFFFF, this::hideTopBar);
 
-        row1.addView(shieldBtn, marginRight(px(116), px(36), 6));
+        row1.addView(shieldBtn, marginRight(px(114), px(36), 6));
         row1.addView(modeBtn, new LinearLayout.LayoutParams(px(124), px(36)));
         vBox.addView(row1, new LinearLayout.LayoutParams(-1, px(40)));
 
@@ -420,8 +864,12 @@ public final class MainActivity extends Activity {
         for (String[] site : QUICK_SITES) {
             final String targetUrl = site[1];
             TextView pill = barButton(site[0], 0x1FFFFFFF, () -> {
-                loadTarget(targetUrl);
-                hideTopBar();
+                if ("brave://sports".equals(targetUrl)) {
+                    showSportsOverlay();
+                } else {
+                    loadTarget(targetUrl);
+                    hideTopBar();
+                }
             });
             pill.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(12.5f));
             row2.addView(pill, marginRight(px(108), px(30), 6));
@@ -490,7 +938,7 @@ public final class MainActivity extends Activity {
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (imm != null && urlInput != null) imm.hideSoftInputFromWindow(urlInput.getWindowToken(), 0);
         topBarCard.setVisibility(View.GONE);
-        if (isYouTubeTvMode()) {
+        if (isYouTubeTvMode() && !sportsVisible) {
             webView.setFocusable(true);
             webView.setFocusableInTouchMode(true);
             webView.requestFocus();
@@ -499,6 +947,11 @@ public final class MainActivity extends Activity {
 
     private void loadTarget(String raw) {
         String q = raw == null ? "" : raw.trim();
+        if (q.equalsIgnoreCase("brave://sports")) {
+            showSportsOverlay();
+            return;
+        }
+        inSportsStreamMode = false;
         if (q.isEmpty() || q.equalsIgnoreCase("brave://home") || q.equalsIgnoreCase("youtube")) {
             q = YT_TV_URL;
         }
@@ -535,9 +988,19 @@ public final class MainActivity extends Activity {
         // Toggle top bar with MENU button anytime, or long-press BACK
         if (key == KeyEvent.KEYCODE_MENU || (key == KeyEvent.KEYCODE_BACK && event.isLongPress())) {
             if (action == KeyEvent.ACTION_DOWN) {
+                if (sportsVisible) hideSportsOverlay();
                 if (barVisible) hideTopBar(); else showTopBar();
             }
             return true;
+        }
+
+        // When Live Sports Hub overlay is open, D-pad navigates match & server cards natively
+        if (sportsVisible) {
+            if (key == KeyEvent.KEYCODE_BACK && action == KeyEvent.ACTION_DOWN) {
+                hideSportsOverlay();
+                return true;
+            }
+            return super.dispatchKeyEvent(event);
         }
 
         // When Top Bar is open, navigate the Top Bar with D-pad
@@ -561,13 +1024,11 @@ public final class MainActivity extends Activity {
             if (key == KeyEvent.KEYCODE_BACK) {
                 if (action == KeyEvent.ACTION_DOWN) {
                     long now = SystemClock.uptimeMillis();
-                    // Double-tap Back within 400ms opens the Brave TV Top Bar
                     if (now - lastBackPress < 400) {
                         showTopBar();
                         return true;
                     }
                     lastBackPress = now;
-                    // Pass Escape key to YouTube TV so it navigates back inside the YouTube TV UI
                     webView.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ESCAPE));
                     webView.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ESCAPE));
                 }
@@ -576,11 +1037,13 @@ public final class MainActivity extends Activity {
             return super.dispatchKeyEvent(event);
         }
 
-        // In Web Browser Mode: BACK opens Top Bar
+        // In Sports Stream Mode: pressing BACK returns straight to the Live Sports server picker!
         if (key == KeyEvent.KEYCODE_BACK) {
             if (action == KeyEvent.ACTION_DOWN) {
                 if (customVideoView != null) {
                     webView.getWebChromeClient().onHideCustomView();
+                } else if (inSportsStreamMode) {
+                    showSportsOverlay();
                 } else {
                     showTopBar();
                 }
@@ -658,7 +1121,7 @@ public final class MainActivity extends Activity {
             c.drawCircle(cursorX, cursorY, r - px(2.2f), paint);
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(0xFFFB542B);
-            c.drawCircle(cursorX, cursorY, px(2.8f), paint);
+            c.drawCircle(cursorX, cursorY, px(3f), paint);
         }
     }
 }
