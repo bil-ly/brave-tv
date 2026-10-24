@@ -69,6 +69,7 @@ public final class MainActivity extends Activity {
     private TextView serversHeaderText;
     private boolean sportsVisible = false;
     private boolean inSportsStreamMode = false;
+    private volatile String activeStreamHost = "";
     private final ExecutorService bgExecutor = Executors.newCachedThreadPool();
 
     // Cursor only used when browsing normal desktop websites (hidden on YouTube TV)
@@ -124,7 +125,16 @@ public final class MainActivity extends Activity {
         "arcadiablankdenying.com", "histats.com", "acscdn.com", "usrpubtrk.com",
         "onclickalgo.com", "onclckmn.com", "wpadmngr.com", "tsyndicate.com",
         "bidgear.com", "galaksion.com", "pushame.com", "pushwhy.com", "rtmark.net",
-        "adcash.com", "alfadart.com", "bet365.com", "1xbet.com", "stake.com"
+        "adcash.com", "alfadart.com", "bet365.com", "1xbet.com", "stake.com",
+        "xadsmart.com", "ubogicetmixgdl.com", "vexlcier.com", "cloudfront.net/kt/"
+    };
+
+    private static final String[] ALLOWED_STREAM_CDNS = {
+        "jsdelivr.net", "cdnjs.cloudflare.com", "code.jquery.com", "unpkg.com",
+        "googleapis.com", "gstatic.com", "wp.com", "vimeocdn.com", "jwpsrv.com",
+        "jwpcdn.com", "swarmcloud.net", "web3-lab.com", "youtube.com",
+        "youtube-nocookie.com", "ytimg.com", "googlevideo.com", "twitch.tv",
+        "ttvnw.net", "akamaized.net", "fastly.net", "cloudflare.com"
     };
 
     // Brave / uBlock style ad-stripping + sports stream popup/overlay killer + 16:9 Cinema Isolator
@@ -179,9 +189,30 @@ public final class MainActivity extends Activity {
         "if(location.hostname.includes('youtube.com'))return;" +
         "var st=document.getElementById('brave-sports-cinema');" +
         "if(!st){st=document.createElement('style');st.id='brave-sports-cinema';document.head&&document.head.appendChild(st);}" +
-        "st.textContent='html,body{background:#000!important;color:#fff!important;margin:0!important;padding:0!important;overflow:hidden!important;} .top-nav,.ad-header,.ad-box,.footer,header,nav,footer,aside,.chat,.sidebar{display:none!important;} .player-container,.player-wrap,#pw{max-width:100vw!important;width:100vw!important;height:100vh!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;background:#000!important;}';" +
-        "var v=document.querySelector('video');" +
-        "if(v){v.muted=false;try{v.play();}catch(e){}}" +
+        "st.textContent='html,body{background:#000!important;color:#fff!important;margin:0!important;padding:0!important;overflow:hidden!important;} .top-nav,.ad-header,.ad-box,.footer,header,nav,footer,aside,.chat,.sidebar,[class*=\"ad-\"],[id*=\"ad-\"],[id*=\"banner\"],[class*=\"banner\"],ins{display:none!important;opacity:0!important;pointer-events:none!important;} .player-container,.player-wrap,#pw,#stage,#player,.player{max-width:100vw!important;width:100vw!important;height:100vh!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;position:fixed!important;top:0!important;left:0!important;z-index:999999!important;background:#000!important;} .player iframe,#player iframe,.player-wrap iframe{width:100vw!important;height:100vh!important;border:0!important;border-radius:0!important;}';" +
+        "function autoStartAndUnmute(){" +
+        "  try{if(typeof WSUnmute==='function')WSUnmute();}catch(e){}" +
+        "  var unmuteBtns=document.querySelectorAll('#UnMutePlayer,.unmute,.alxskin__mute,.alxskin__play,[aria-label*=\"Unmute\"]');" +
+        "  for(var i=0;i<unmuteBtns.length;i++){try{unmuteBtns[i].click();}catch(e){}}" +
+        "  var v=document.querySelector('video');" +
+        "  if(v){v.muted=false;v.volume=1.0;try{v.play();}catch(e){}}" +
+        "  var bad=document.querySelectorAll('div,a,ins,iframe');" +
+        "  for(var j=0;j<bad.length;j++){" +
+        "    var el=bad[j];" +
+        "    if(el.tagName==='IFRAME'){" +
+        "      var r=el.getBoundingClientRect();" +
+        "      if((r.width>0&&r.width<350)||(r.height>0&&r.height<180)){el.remove();continue;}" +
+        "    } else {" +
+        "      var cs=window.getComputedStyle(el);" +
+        "      var z=parseInt(cs.zIndex,10)||0;" +
+        "      if((cs.position==='fixed'||cs.position==='absolute')&&z>50&&!el.querySelector('video,iframe')&&el.id!=='player'&&el.id!=='pw'&&!el.classList.contains('player')&&!el.classList.contains('player-wrap')){" +
+        "        el.remove();" +
+        "      }" +
+        "    }" +
+        "  }" +
+        "}" +
+        "autoStartAndUnmute();" +
+        "if(!window.__braveSportsTimer){window.__braveSportsTimer=setInterval(autoStartAndUnmute,500);}" +
         "})();";
 
     private int px(float v) { return Math.round(v * unit); }
@@ -293,8 +324,16 @@ public final class MainActivity extends Activity {
                 if (req == null || req.getUrl() == null) return false;
                 String url = req.getUrl().toString();
                 String host = req.getUrl().getHost() != null ? req.getUrl().getHost().toLowerCase(Locale.US) : "";
-                // Block non-HTTP intents and ad-redirect navigations
+                // Block non-HTTP intents
                 if (!(url.startsWith("http://") || url.startsWith("https://"))) return true;
+                // In Sports Stream Mode, NEVER allow top-frame ad redirects away from the stream server!
+                if (inSportsStreamMode && req.isForMainFrame()) {
+                    if (!activeStreamHost.isEmpty() && !host.equals(activeStreamHost) && !host.endsWith("." + activeStreamHost)) {
+                        blockedCount.incrementAndGet();
+                        updateShieldPill();
+                        return true;
+                    }
+                }
                 if (shieldsEnabled && isBlockedUrl(host, url.toLowerCase(Locale.US))) {
                     blockedCount.incrementAndGet();
                     updateShieldPill();
@@ -403,11 +442,43 @@ public final class MainActivity extends Activity {
         for (String domain : AD_DOMAINS) {
             if (host.equals(domain) || host.endsWith("." + domain)) return true;
         }
-        return fullUrl.contains("/pagead/") || fullUrl.contains("/ptracking") ||
-               fullUrl.contains("/api/stats/ads") || fullUrl.contains("get_midroll_info") ||
-               fullUrl.contains("/adserver") || fullUrl.contains("popunder") ||
-               fullUrl.contains("histats.com") || fullUrl.contains("aclib") ||
-               fullUrl.contains("ytr5541122hhgfdd.js");
+        if (fullUrl.contains("/pagead/") || fullUrl.contains("/ptracking") ||
+            fullUrl.contains("/api/stats/ads") || fullUrl.contains("get_midroll_info") ||
+            fullUrl.contains("/adserver") || fullUrl.contains("popunder") ||
+            fullUrl.contains("histats.com") || fullUrl.contains("aclib") ||
+            fullUrl.contains("ytr5541122hhgfdd.js") || fullUrl.contains("jscroll.min.js") ||
+            fullUrl.contains("ematrix.min.css") || fullUrl.contains("nmatrix.min.css")) {
+            return true;
+        }
+        // Strict Zero-Ad Lock when watching a Sports Stream Server:
+        // Block all third-party random ad-script fetches (e.g. domain.com/22/<32-char-md5>)
+        if (inSportsStreamMode) {
+            // Always allow HLS video playlists, segments, and player iframes
+            if (fullUrl.contains(".m3u8") || fullUrl.contains(".ts") || fullUrl.contains(".mp4") ||
+                fullUrl.contains(".m4s") || fullUrl.contains(".aac") || fullUrl.contains("embed") ||
+                fullUrl.contains("player") || fullUrl.contains("stream") || fullUrl.contains("hls") ||
+                fullUrl.contains("ch-") || fullUrl.contains("ch3") || fullUrl.contains("watch")) {
+                return false;
+            }
+            // Block Adsterra / PopAds 32-char hex script paths on rotating domains
+            if (fullUrl.matches(".*\\/[0-9a-f]{32}(\\.js)?(\\?.*)?$")) {
+                return true;
+            }
+            // If it's a third-party JS script not from the active stream host or known player CDNs, block it!
+            if (!activeStreamHost.isEmpty() && !host.equals(activeStreamHost) && !host.endsWith("." + activeStreamHost)) {
+                boolean allowedCdn = false;
+                for (String cdn : ALLOWED_STREAM_CDNS) {
+                    if (host.equals(cdn) || host.endsWith("." + cdn)) {
+                        allowedCdn = true;
+                        break;
+                    }
+                }
+                if (!allowedCdn && (fullUrl.endsWith(".js") || fullUrl.contains(".js?") || fullUrl.contains("/tracker"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private void injectViewportFit(String url) {
@@ -749,10 +820,56 @@ public final class MainActivity extends Activity {
         hideSportsOverlay();
         sportsStatusText.setText("Playing: " + srv.name);
         webView.getSettings().setUserAgentString(DESKTOP_UA);
-        Map<String, String> headers = new HashMap<>();
-        headers.put("Referer", "http://sportslinks.is/");
         syncModeForUrl(srv.url);
-        webView.loadUrl(srv.url, headers);
+
+        // Deep-unwrap nested player iframes in background so we skip the outer ad-wrapper webpage completely!
+        bgExecutor.execute(() -> {
+            String targetUrl = srv.url;
+            String referer = "http://sportslinks.is/";
+            try {
+                for (int depth = 0; depth < 2; depth++) {
+                    String html = httpGet(targetUrl, referer);
+                    Matcher m = Pattern.compile(
+                        "<iframe[^>]+src=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html);
+                    String foundIframe = null;
+                    while (m.find()) {
+                        String candidate = m.group(1).trim();
+                        if (candidate.isEmpty() || candidate.startsWith("about:") || candidate.startsWith("javascript:")) continue;
+                        String low = candidate.toLowerCase(Locale.US);
+                        if (low.contains("doubleclick") || low.contains("googlesyndication") ||
+                            low.contains("adsterra") || low.contains("exoclick") || low.contains("czernik")) {
+                            continue;
+                        }
+                        if (candidate.startsWith("//")) {
+                            candidate = "https:" + candidate;
+                        } else if (candidate.startsWith("/")) {
+                            URL base = new URL(targetUrl);
+                            candidate = base.getProtocol() + "://" + base.getHost() + candidate;
+                        }
+                        foundIframe = candidate;
+                        break;
+                    }
+                    if (foundIframe != null && !foundIframe.equals(targetUrl)) {
+                        referer = targetUrl;
+                        targetUrl = foundIframe;
+                    } else {
+                        break;
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            final String finalUrl = targetUrl;
+            final String finalReferer = referer;
+            String host = Uri.parse(finalUrl).getHost();
+            activeStreamHost = host != null ? host.toLowerCase(Locale.US) : "";
+
+            handler.post(() -> {
+                Map<String, String> headers = new HashMap<>();
+                headers.put("Referer", finalReferer);
+                syncModeForUrl(finalUrl);
+                webView.loadUrl(finalUrl, headers);
+            });
+        });
     }
 
     private String httpGet(String urlStr, String referer) throws Exception {
