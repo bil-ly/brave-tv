@@ -542,11 +542,17 @@ public final class MainActivity extends Activity {
         sportsStatusText.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(13));
         header.addView(sportsStatusText, new LinearLayout.LayoutParams(0, -2, 1f));
 
+        TextView ytSwitchBtn = barButton("▶ YouTube TV", 0xFFFF0033, () -> {
+            hideSportsOverlay();
+            loadTarget(YT_TV_URL);
+        });
+        header.addView(ytSwitchBtn, marginRight(px(124), px(34), 10));
+
         TextView refreshBtn = barButton("↻ Refresh Matches", 0xFF1E293B, this::fetchTelegramMatches);
         header.addView(refreshBtn, marginRight(px(140), px(34), 10));
 
-        TextView closeBtn = barButton("✕ Back to Video", 0x26FFFFFF, this::hideSportsOverlay);
-        header.addView(closeBtn, new LinearLayout.LayoutParams(px(130), px(34)));
+        TextView closeBtn = barButton("✕ Close Hub", 0x26FFFFFF, this::hideSportsOverlay);
+        header.addView(closeBtn, new LinearLayout.LayoutParams(px(110), px(34)));
 
         mainCol.addView(header, new LinearLayout.LayoutParams(-1, px(44)));
 
@@ -1115,6 +1121,7 @@ public final class MainActivity extends Activity {
         if (sportsVisible) {
             if (key == KeyEvent.KEYCODE_BACK && action == KeyEvent.ACTION_DOWN) {
                 hideSportsOverlay();
+                showTopBar();
                 return true;
             }
             return super.dispatchKeyEvent(event);
