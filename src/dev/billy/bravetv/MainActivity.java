@@ -72,6 +72,30 @@ public final class MainActivity extends Activity {
     private volatile String activeStreamHost = "";
     private final ExecutorService bgExecutor = Executors.newCachedThreadPool();
 
+    // Native Movies & Series Cinema Hub Overlay (Goojara + VidSrc + 2Embed + MultiEmbed)
+    private FrameLayout moviesOverlay;
+    private LinearLayout moviesListContainer;
+    private LinearLayout movieSourcesContainer;
+    private TextView moviesStatusText;
+    private TextView movieDetailTitle;
+    private TextView movieDetailMeta;
+    private TextView movieDetailDesc;
+    private EditText movieSearchInput;
+    private boolean moviesVisible = false;
+    private volatile String goojaraCookie = "";
+    private volatile String goojaraSearchToken = "";
+
+    private static final class MovieItem {
+        final String title;
+        final String yearOrType;
+        final String path;
+        MovieItem(String title, String yearOrType, String path) {
+            this.title = title;
+            this.yearOrType = yearOrType;
+            this.path = path;
+        }
+    }
+
     // Cursor only used when browsing normal desktop websites (hidden on YouTube TV)
     private CursorView cursorView;
     private float cursorX, cursorY;
@@ -105,10 +129,10 @@ public final class MainActivity extends Activity {
     private static final String[][] QUICK_SITES = {
         {"▶ YouTube TV", "https://www.youtube.com/tv", "#FF0033"},
         {"⚽ Live Soccer", "brave://sports", "#10B981"},
+        {"🎬 Movies & TV", "brave://movies", "#F59E0B"},
         {"🦁 Brave Search", "https://search.brave.com", "#FB542B"},
         {"HiAnime", "https://hianime.to", "#FFBADE"},
-        {"Twitch", "https://www.twitch.tv", "#9146FF"},
-        {"GitHub", "https://github.com/bil-ly", "#2B3137"}
+        {"Twitch", "https://www.twitch.tv", "#9146FF"}
     };
 
     private static final String[] AD_DOMAINS = {
@@ -254,6 +278,7 @@ public final class MainActivity extends Activity {
         createProgressBar();
         createCursor();
         createSportsOverlay();
+        createMoviesOverlay();
         createTopBar();
 
         fullscreenContainer = new FrameLayout(this);
@@ -426,12 +451,12 @@ public final class MainActivity extends Activity {
     private void syncModeForUrl(String url) {
         boolean ytTv = url != null && (url.contains("youtube.com/tv") || url.contains("youtube.com/leanback"));
         if (cursorView != null) {
-            cursorView.setVisibility((ytTv || sportsVisible) ? View.GONE : View.VISIBLE);
+            cursorView.setVisibility((ytTv || sportsVisible || moviesVisible) ? View.GONE : View.VISIBLE);
         }
         if (modeBtn != null) {
-            modeBtn.setText(ytTv ? "Mode: Native TV" : (inSportsStreamMode ? "Mode: Sports Cinema" : "Mode: Web Pointer"));
+            modeBtn.setText(ytTv ? "Mode: Native TV" : (inSportsStreamMode ? "Mode: Cinema Stream" : "Mode: Web Pointer"));
         }
-        if (ytTv && !barVisible && !sportsVisible) {
+        if (ytTv && !barVisible && !sportsVisible && !moviesVisible) {
             webView.setFocusable(true);
             webView.setFocusableInTouchMode(true);
             webView.requestFocus();
@@ -909,6 +934,552 @@ public final class MainActivity extends Activity {
     }
 
     // =========================================================================
+    // NATIVE MOVIES & SERIES HUB (Goojara + VidSrc + 2Embed + MultiEmbed)
+    // =========================================================================
+    private void createMoviesOverlay() {
+        moviesOverlay = new FrameLayout(this);
+        moviesOverlay.setBackgroundColor(0xF40B0E16);
+        moviesOverlay.setVisibility(View.GONE);
+
+        LinearLayout mainCol = new LinearLayout(this);
+        mainCol.setOrientation(LinearLayout.VERTICAL);
+        mainCol.setPadding(px(32), px(22), px(32), px(22));
+
+        // Header Row
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView badge = new TextView(this);
+        badge.setText("🎬 CINEMA HUB");
+        badge.setTextColor(0xFFF59E0B);
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(18));
+        badge.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        header.addView(badge, marginRight(-2, -2, 14));
+
+        TextView popularBtn = barButton("🔥 Popular", 0xFF1E293B, () -> fetchGoojaraList("/watch-trends-popular", "Popular Movies & Series"));
+        TextView recentMoviesBtn = barButton("🆕 New Movies", 0xFF1E293B, () -> fetchGoojaraList("/watch-movies", "Latest Movies"));
+        TextView seriesBtn = barButton("📺 TV Series", 0xFF1E293B, () -> fetchGoojaraList("/watch-series-recent", "Recent TV Series"));
+        header.addView(popularBtn, marginRight(px(94), px(34), 6));
+        header.addView(recentMoviesBtn, marginRight(px(108), px(34), 6));
+        header.addView(seriesBtn, marginRight(px(100), px(34), 10));
+
+        movieSearchInput = new EditText(this);
+        movieSearchInput.setSingleLine(true);
+        movieSearchInput.setHint("Search any movie or series (e.g. Spider-Man, Batman)…");
+        movieSearchInput.setHintTextColor(0x88FFFFFF);
+        movieSearchInput.setTextColor(Color.WHITE);
+        movieSearchInput.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(13));
+        movieSearchInput.setPadding(px(12), 0, px(12), 0);
+        movieSearchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        movieSearchInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+        Runnable paintSearch = () -> movieSearchInput.setBackground(
+            shape(0xFF1C2130, 10, movieSearchInput.hasFocus() ? 0xFFF59E0B : 0x33FFFFFF, movieSearchInput.hasFocus() ? 2f : 1f));
+        paintSearch.run();
+        movieSearchInput.setOnFocusChangeListener((v, f) -> paintSearch.run());
+        movieSearchInput.setOnEditorActionListener((v, actionId, event) -> {
+            String q = movieSearchInput.getText().toString().trim();
+            if (!q.isEmpty()) {
+                InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                if (imm != null) imm.hideSoftInputFromWindow(movieSearchInput.getWindowToken(), 0);
+                searchGoojara(q);
+            }
+            return true;
+        });
+        LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(0, px(34), 1f);
+        sLp.rightMargin = px(10);
+        header.addView(movieSearchInput, sLp);
+
+        TextView ytBtn = barButton("▶ YouTube TV", 0xFFFF0033, () -> { hideMoviesOverlay(); loadTarget(YT_TV_URL); });
+        TextView closeBtn = barButton("✕ Close", 0x26FFFFFF, this::hideMoviesOverlay);
+        header.addView(ytBtn, marginRight(px(114), px(34), 8));
+        header.addView(closeBtn, new LinearLayout.LayoutParams(px(82), px(34)));
+
+        mainCol.addView(header, new LinearLayout.LayoutParams(-1, px(40)));
+
+        moviesStatusText = new TextView(this);
+        moviesStatusText.setText("Powered by Goojara + VidSrc 1080p + 2Embed + MultiEmbed · Zero Ads");
+        moviesStatusText.setTextColor(0x99FFFFFF);
+        moviesStatusText.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11.5f));
+        LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(-1, px(20));
+        stLp.topMargin = px(4);
+        mainCol.addView(moviesStatusText, stLp);
+
+        // Two-Column Body: Left = Movie/Series Catalog, Right = Details + Multi-Engine Stream Servers
+        LinearLayout columns = new LinearLayout(this);
+        columns.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams colLp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        colLp.topMargin = px(8);
+
+        // Left Column (Movies & Series List)
+        LinearLayout leftBox = new LinearLayout(this);
+        leftBox.setOrientation(LinearLayout.VERTICAL);
+        leftBox.setBackground(shape(0xFF131824, 16, 0x22FFFFFF, 1));
+        leftBox.setPadding(px(14), px(12), px(14), px(12));
+
+        TextView leftTitle = new TextView(this);
+        leftTitle.setText("1. SELECT MOVIE OR SERIES");
+        leftTitle.setTextColor(0xFFF59E0B);
+        leftTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11.5f));
+        leftTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        leftBox.addView(leftTitle, new LinearLayout.LayoutParams(-1, px(20)));
+
+        ScrollView listScroll = new ScrollView(this);
+        listScroll.setVerticalScrollBarEnabled(false);
+        moviesListContainer = new LinearLayout(this);
+        moviesListContainer.setOrientation(LinearLayout.VERTICAL);
+        listScroll.addView(moviesListContainer, new FrameLayout.LayoutParams(-1, -2));
+        leftBox.addView(listScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        LinearLayout.LayoutParams leftLp = new LinearLayout.LayoutParams(0, -1, 1.0f);
+        leftLp.rightMargin = px(14);
+        columns.addView(leftBox, leftLp);
+
+        // Right Column (Movie Details + Servers / Episodes)
+        LinearLayout rightBox = new LinearLayout(this);
+        rightBox.setOrientation(LinearLayout.VERTICAL);
+        rightBox.setBackground(shape(0xFF131824, 16, 0x22FFFFFF, 1));
+        rightBox.setPadding(px(16), px(14), px(16), px(14));
+
+        movieDetailTitle = new TextView(this);
+        movieDetailTitle.setText("Select a title on the left");
+        movieDetailTitle.setTextColor(Color.WHITE);
+        movieDetailTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(17));
+        movieDetailTitle.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        movieDetailTitle.setSingleLine(true);
+        movieDetailTitle.setEllipsize(TextUtils.TruncateAt.END);
+        rightBox.addView(movieDetailTitle);
+
+        movieDetailMeta = new TextView(this);
+        movieDetailMeta.setText("");
+        movieDetailMeta.setTextColor(0xFFF59E0B);
+        movieDetailMeta.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(12));
+        movieDetailMeta.setSingleLine(true);
+        rightBox.addView(movieDetailMeta);
+
+        movieDetailDesc = new TextView(this);
+        movieDetailDesc.setText("");
+        movieDetailDesc.setTextColor(0xBBFFFFFF);
+        movieDetailDesc.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(12));
+        movieDetailDesc.setMaxLines(3);
+        movieDetailDesc.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams descLp = new LinearLayout.LayoutParams(-1, -2);
+        descLp.topMargin = px(4);
+        descLp.bottomMargin = px(10);
+        rightBox.addView(movieDetailDesc, descLp);
+
+        ScrollView srcScroll = new ScrollView(this);
+        srcScroll.setVerticalScrollBarEnabled(false);
+        movieSourcesContainer = new LinearLayout(this);
+        movieSourcesContainer.setOrientation(LinearLayout.VERTICAL);
+        srcScroll.addView(movieSourcesContainer, new FrameLayout.LayoutParams(-1, -2));
+        rightBox.addView(srcScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        columns.addView(rightBox, new LinearLayout.LayoutParams(0, -1, 1.25f));
+        mainCol.addView(columns, colLp);
+
+        moviesOverlay.addView(mainCol, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(moviesOverlay, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void showMoviesOverlay() {
+        hideTopBar();
+        if (sportsVisible) hideSportsOverlay();
+        moviesVisible = true;
+        moviesOverlay.setVisibility(View.VISIBLE);
+        cursorView.setVisibility(View.GONE);
+        if (moviesListContainer.getChildCount() == 0) {
+            fetchGoojaraList("/watch-trends-popular", "Popular Movies & Series");
+        } else {
+            moviesListContainer.getChildAt(0).requestFocus();
+        }
+    }
+
+    private void hideMoviesOverlay() {
+        moviesVisible = false;
+        moviesOverlay.setVisibility(View.GONE);
+        syncModeForUrl(webView.getUrl());
+    }
+
+    private void updateGoojaraSession(String html, HttpURLConnection conn) {
+        StringBuilder cookieSb = new StringBuilder();
+        if (conn != null) {
+            Map<String, List<String>> hdrs = conn.getHeaderFields();
+            List<String> setCookies = hdrs.get("Set-Cookie");
+            if (setCookies == null) setCookies = hdrs.get("set-cookie");
+            if (setCookies != null) {
+                for (String sc : setCookies) {
+                    String pair = sc.split(";")[0].trim();
+                    if (!pair.isEmpty()) {
+                        if (cookieSb.length() > 0) cookieSb.append("; ");
+                        cookieSb.append(pair);
+                    }
+                }
+            }
+        }
+        Matcher chk = Pattern.compile("_3chk\\(['\"]([^'\"]+)['\"],\\s*['\"]([^'\"]+)['\"]\\)").matcher(html);
+        if (chk.find()) {
+            if (cookieSb.length() > 0) cookieSb.append("; ");
+            cookieSb.append(chk.group(1)).append("=").append(chk.group(2));
+        }
+        if (cookieSb.length() > 0) {
+            goojaraCookie = cookieSb.toString();
+        }
+        Matcher xTok = Pattern.compile("x=([0-9a-f]+)&q=").matcher(html);
+        if (xTok.find()) {
+            goojaraSearchToken = xTok.group(1);
+        }
+    }
+
+    private void fetchGoojaraList(String path, String label) {
+        moviesStatusText.setText("Loading " + label + " from Goojara…");
+        moviesListContainer.removeAllViews();
+        bgExecutor.execute(() -> {
+            List<MovieItem> items = new ArrayList<>();
+            try {
+                URL url = new URL("https://ww1.goojara.to" + path);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setRequestProperty("User-Agent", DESKTOP_UA);
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append('\n');
+                }
+                String html = sb.toString();
+                updateGoojaraSession(html, conn);
+
+                Matcher m = Pattern.compile(
+                    "<a[^>]+href=[\"'](?:https?://[^/\"']+)?(/[mte][A-Za-z0-9]{4,10})[\"'][^>]*>(.*?)</a>",
+                    Pattern.DOTALL).matcher(html);
+                Set<String> seen = new HashSet<>();
+                while (m.find()) {
+                    String itemPath = m.group(1).trim();
+                    if (!seen.add(itemPath)) continue;
+                    String inner = m.group(2);
+                    String title = inner.replaceAll("<span class=\"hd[^>]*>.*?</span>", "")
+                                        .replaceAll("<[^>]+>", " ")
+                                        .replaceAll("\\s+", " ").trim();
+                    if (title.isEmpty()) continue;
+                    String year = itemPath.startsWith("/t") ? "TV Series" : "Movie";
+                    Matcher ym = Pattern.compile("\\((\\d{4})\\)").matcher(inner);
+                    if (ym.find()) year = ym.group(1) + (itemPath.startsWith("/t") ? " · Series" : " · Movie");
+                    items.add(new MovieItem(title, year, itemPath));
+                }
+            } catch (Exception e) {
+                handler.post(() -> moviesStatusText.setText("Error loading Goojara catalog: " + e.getMessage()));
+                return;
+            }
+            populateMovieCards(items, label);
+        });
+    }
+
+    private void searchGoojara(String query) {
+        moviesStatusText.setText("Searching Goojara for \"" + query + "\"…");
+        moviesListContainer.removeAllViews();
+        bgExecutor.execute(() -> {
+            List<MovieItem> items = new ArrayList<>();
+            try {
+                if (goojaraSearchToken.isEmpty() || goojaraCookie.isEmpty()) {
+                    URL initUrl = new URL("https://ww1.goojara.to/watch-movies");
+                    HttpURLConnection ic = (HttpURLConnection) initUrl.openConnection();
+                    ic.setRequestProperty("User-Agent", DESKTOP_UA);
+                    StringBuilder isb = new StringBuilder();
+                    try (BufferedReader br = new BufferedReader(new InputStreamReader(ic.getInputStream(), StandardCharsets.UTF_8))) {
+                        String l;
+                        while ((l = br.readLine()) != null) isb.append(l).append('\n');
+                    }
+                    updateGoojaraSession(isb.toString(), ic);
+                }
+                URL u = new URL("https://ww1.goojara.to/xmre.php");
+                HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setRequestProperty("User-Agent", DESKTOP_UA);
+                conn.setRequestProperty("Referer", "https://ww1.goojara.to/watch-movies");
+                conn.setRequestProperty("Cookie", goojaraCookie);
+                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+                String body = "x=" + goojaraSearchToken + "&q=" + Uri.encode(query);
+                conn.getOutputStream().write(body.getBytes(StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append('\n');
+                }
+                Matcher m = Pattern.compile("<a href=\"(/[mte][A-Za-z0-9]+)\"><div class=\"(im|it)\"><strong>(.*?)</strong>\\s*([^<]*)</div></a>").matcher(sb.toString());
+                while (m.find()) {
+                    String p = m.group(1);
+                    String type = "it".equals(m.group(2)) ? "Series" : "Movie";
+                    String t = m.group(3).trim();
+                    String yr = m.group(4).replaceAll("[()]", "").trim();
+                    items.add(new MovieItem(t, (yr.isEmpty() ? "" : yr + " · ") + type, p));
+                }
+            } catch (Exception e) {
+                handler.post(() -> moviesStatusText.setText("Search failed: " + e.getMessage()));
+                return;
+            }
+            populateMovieCards(items, "Search: \"" + query + "\"");
+        });
+    }
+
+    private void populateMovieCards(List<MovieItem> items, String label) {
+        handler.post(() -> {
+            moviesListContainer.removeAllViews();
+            if (items.isEmpty()) {
+                moviesStatusText.setText("No results found for " + label);
+                return;
+            }
+            moviesStatusText.setText(label + " (" + items.size() + " titles) · Select any title for instant 1080p servers");
+            for (int i = 0; i < items.size(); i++) {
+                MovieItem item = items.get(i);
+                View card = createMovieCard(item);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+                lp.topMargin = px(7);
+                moviesListContainer.addView(card, lp);
+                if (i == 0) {
+                    card.requestFocus();
+                    fetchMovieDetailsAndServers(item);
+                }
+            }
+        });
+    }
+
+    private View createMovieCard(MovieItem item) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(px(14), px(9), px(14), px(9));
+        row.setFocusable(true);
+        row.setFocusableInTouchMode(true);
+
+        TextView meta = new TextView(this);
+        meta.setText(item.yearOrType.toUpperCase(Locale.US));
+        meta.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(10.5f));
+        meta.setSingleLine(true);
+
+        TextView title = new TextView(this);
+        title.setText(item.title);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(14.5f));
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        title.setSingleLine(true);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+
+        row.addView(meta);
+        row.addView(title);
+
+        Runnable paint = () -> {
+            boolean f = row.hasFocus();
+            row.setBackground(shape(f ? 0xFFF59E0B : 0xFF1B2234, 11, f ? Color.WHITE : 0x22FFFFFF, f ? 2f : 1f));
+            meta.setTextColor(f ? 0xFF3B2100 : 0xFFF59E0B);
+            title.setTextColor(f ? 0xFF111827 : Color.WHITE);
+        };
+        paint.run();
+        row.setOnFocusChangeListener((v, f) -> paint.run());
+        row.setOnClickListener(v -> fetchMovieDetailsAndServers(item));
+        return row;
+    }
+
+    private void fetchMovieDetailsAndServers(MovieItem item) {
+        movieDetailTitle.setText(item.title);
+        movieDetailMeta.setText("Loading servers & details…");
+        movieDetailDesc.setText("");
+        movieSourcesContainer.removeAllViews();
+
+        bgExecutor.execute(() -> {
+            try {
+                String pageUrl = "https://ww1.goojara.to" + item.path;
+                URL u = new URL(pageUrl);
+                HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setRequestProperty("User-Agent", DESKTOP_UA);
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append('\n');
+                }
+                String html = sb.toString();
+                updateGoojaraSession(html, conn);
+
+                // Extract description & IMDb ID
+                String desc = "";
+                Matcher dm = Pattern.compile("<div class=\"fimm\">\\s*<p>(.*?)</p>", Pattern.DOTALL).matcher(html);
+                if (!dm.find()) {
+                    dm = Pattern.compile("<div class=\"marl\">.*?<p>(.*?)</p>", Pattern.DOTALL).matcher(html);
+                }
+                if (dm.find()) {
+                    desc = dm.group(1).replaceAll("<[^>]+>", "").trim();
+                }
+
+                String metaInfo = item.yearOrType;
+                Matcher dateM = Pattern.compile("<div class=\"date\">(.*?)</div>", Pattern.DOTALL).matcher(html);
+                if (dateM.find()) {
+                    metaInfo = dateM.group(1).replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+                }
+
+                String imdbId = null;
+                Matcher imdbM = Pattern.compile("(tt\\d{6,10})").matcher(html);
+                if (imdbM.find()) {
+                    imdbId = imdbM.group(1);
+                }
+
+                // Check if this is a TV Series page with Episode links
+                List<MovieItem> episodes = new ArrayList<>();
+                if (item.path.startsWith("/t")) {
+                    Matcher epM = Pattern.compile(
+                        "<span class=\"sea\">\\s*(\\d+)</span><span>(Season\\s*\\d+)</span>.*?<h1><a href=\"(/e[A-Za-z0-9]+)\">(.*?)</a></h1>",
+                        Pattern.DOTALL).matcher(html);
+                    while (epM.find()) {
+                        String epNum = epM.group(1).trim();
+                        String season = epM.group(2).trim();
+                        String epPath = epM.group(3).trim();
+                        String epTitle = epM.group(4).replaceAll("<[^>]+>", "").trim();
+                        episodes.add(new MovieItem(season + " · Ep " + epNum + " — " + epTitle, "Episode", epPath));
+                    }
+                }
+
+                // Extract Goojara Direct Links (Wootly, Luluvdo, Dood)
+                List<ServerItem> servers = new ArrayList<>();
+                Matcher goM = Pattern.compile(
+                    "<a class=\"bcg\" href=\"(https://ww1\\.goojara\\.to/go\\.php\\?url=[^\"]+)\">(.*?)</a>",
+                    Pattern.DOTALL).matcher(html);
+                while (goM.find()) {
+                    String goUrl = goM.group(1);
+                    String srvName = goM.group(2).replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+                    servers.add(new ServerItem("Goojara · " + srvName + " (Direct)", goUrl));
+                }
+
+                // Add Multi-Provider 1080p Auto-Embed Servers using IMDb ID!
+                if (imdbId != null && !item.path.startsWith("/t")) {
+                    servers.add(new ServerItem("VidSrc.pm · 1080p FHD Auto-Stream (" + imdbId + ")", "https://vidsrc.pm/embed/movie?imdb=" + imdbId));
+                    servers.add(new ServerItem("VidSrc.me · 1080p Cloud Mirror (" + imdbId + ")", "https://vidsrc.me/embed/movie?imdb=" + imdbId));
+                    servers.add(new ServerItem("MultiEmbed · SuperStream FHD (" + imdbId + ")", "https://multiembed.mov/?video_id=" + imdbId));
+                    servers.add(new ServerItem("2Embed.cc · Multi-Server HD (" + imdbId + ")", "https://www.2embed.cc/embed/" + imdbId));
+                }
+
+                // Always offer opening the Goojara page itself with shields as fallback
+                servers.add(new ServerItem("Goojara Web Player · Native Page", pageUrl));
+
+                final String finalDesc = desc;
+                final String finalMeta = metaInfo;
+                final String finalCookie = goojaraCookie;
+                final String finalPageUrl = pageUrl;
+
+                handler.post(() -> {
+                    movieDetailMeta.setText(finalMeta);
+                    movieDetailDesc.setText(finalDesc);
+                    movieSourcesContainer.removeAllViews();
+
+                    if (!episodes.isEmpty()) {
+                        for (MovieItem ep : episodes) {
+                            View epCard = createMovieCard(ep);
+                            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+                            lp.topMargin = px(6);
+                            movieSourcesContainer.addView(epCard, lp);
+                        }
+                        return;
+                    }
+
+                    int idx = 1;
+                    for (ServerItem srv : servers) {
+                        View srvCard = createMovieServerCard(srv, idx++, finalPageUrl, finalCookie);
+                        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+                        lp.topMargin = px(7);
+                        movieSourcesContainer.addView(srvCard, lp);
+                    }
+                });
+            } catch (Exception e) {
+                handler.post(() -> movieDetailMeta.setText("Error loading movie: " + e.getMessage()));
+            }
+        });
+    }
+
+    private View createMovieServerCard(ServerItem srv, int index, String refererPage, String cookie) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(px(14), px(10), px(14), px(10));
+        row.setFocusable(true);
+        row.setFocusableInTouchMode(true);
+
+        TextView num = new TextView(this);
+        num.setText("STREAM #" + index);
+        num.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(11.5f));
+        num.setTypeface(Typeface.create("sans-serif-black", Typeface.BOLD));
+        row.addView(num, marginRight(px(90), -2, 10));
+
+        TextView name = new TextView(this);
+        name.setText(srv.name);
+        name.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(13.5f));
+        name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        row.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        Runnable paint = () -> {
+            boolean f = row.hasFocus();
+            row.setBackground(shape(f ? Color.WHITE : 0xFF1B2234, 10, f ? 0xFFF59E0B : 0x22FFFFFF, f ? 2f : 1f));
+            num.setTextColor(f ? 0xFF92400E : 0xFFF59E0B);
+            name.setTextColor(f ? 0xFF111827 : Color.WHITE);
+        };
+        paint.run();
+        row.setOnFocusChangeListener((v, f) -> paint.run());
+        row.setOnClickListener(v -> launchCleanMovieServer(srv, refererPage, cookie));
+        return row;
+    }
+
+    private void launchCleanMovieServer(ServerItem srv, String refererPage, String cookie) {
+        inSportsStreamMode = true;
+        hideMoviesOverlay();
+        webView.getSettings().setUserAgentString(DESKTOP_UA);
+
+        bgExecutor.execute(() -> {
+            String targetUrl = srv.url;
+            String currentRef = refererPage;
+            try {
+                // If it's a Goojara go.php link, resolve its 302 redirect with the _3chk session cookie!
+                if (targetUrl.contains("goojara.to/go.php")) {
+                    HttpURLConnection conn = (HttpURLConnection) new URL(targetUrl).openConnection();
+                    conn.setInstanceFollowRedirects(false);
+                    conn.setRequestProperty("User-Agent", DESKTOP_UA);
+                    conn.setRequestProperty("Referer", refererPage);
+                    if (cookie != null && !cookie.isEmpty()) conn.setRequestProperty("Cookie", cookie);
+                    int code = conn.getResponseCode();
+                    if (code >= 300 && code < 400) {
+                        String loc = conn.getHeaderField("Location");
+                        if (loc != null) {
+                            currentRef = "https://ww1.goojara.to/";
+                            targetUrl = loc;
+                        }
+                    }
+                    conn.disconnect();
+                }
+
+                // If it resolved to Wootly wrapper page, unwrap its inner web.wootly.ch/e/... iframe
+                if (targetUrl.contains("wootly.ch/?v=")) {
+                    String html = httpGet(targetUrl, currentRef);
+                    Matcher m = Pattern.compile("<iframe[^>]+src=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html);
+                    if (m.find()) {
+                        currentRef = targetUrl;
+                        targetUrl = m.group(1);
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            final String finalUrl = targetUrl;
+            final String finalRef = currentRef;
+            String host = Uri.parse(finalUrl).getHost();
+            activeStreamHost = host != null ? host.toLowerCase(Locale.US) : "";
+
+            handler.post(() -> {
+                Map<String, String> headers = new HashMap<>();
+                headers.put("Referer", finalRef);
+                syncModeForUrl(finalUrl);
+                webView.loadUrl(finalUrl, headers);
+            });
+        });
+    }
+
+    // =========================================================================
     // TOP BAR & NAVIGATION
     // =========================================================================
     private void createTopBar() {
@@ -927,13 +1498,15 @@ public final class MainActivity extends Activity {
 
         View ytBtn = barButton("▶ YouTube TV", 0xFFFF0033, () -> { loadTarget(YT_TV_URL); hideTopBar(); });
         View sportsBtn = barButton("⚽ Live Soccer", 0xFF059669, this::showSportsOverlay);
+        View moviesBtn = barButton("🎬 Movies", 0xFFD97706, this::showMoviesOverlay);
         View backBtn = barButton("←", 0x26FFFFFF, () -> { if (webView.canGoBack()) webView.goBack(); hideTopBar(); });
         View reloadBtn = barButton("↻", 0x26FFFFFF, () -> { webView.reload(); hideTopBar(); });
 
-        row1.addView(ytBtn, marginRight(px(102), px(36), 6));
-        row1.addView(sportsBtn, marginRight(px(108), px(36), 6));
-        row1.addView(backBtn, marginRight(px(38), px(36), 6));
-        row1.addView(reloadBtn, marginRight(px(38), px(36), 8));
+        row1.addView(ytBtn, marginRight(px(98), px(36), 6));
+        row1.addView(sportsBtn, marginRight(px(102), px(36), 6));
+        row1.addView(moviesBtn, marginRight(px(88), px(36), 6));
+        row1.addView(backBtn, marginRight(px(36), px(36), 6));
+        row1.addView(reloadBtn, marginRight(px(36), px(36), 8));
 
         urlInput = new EditText(this);
         urlInput.setSingleLine(true);
@@ -989,6 +1562,8 @@ public final class MainActivity extends Activity {
             TextView pill = barButton(site[0], 0x1FFFFFFF, () -> {
                 if ("brave://sports".equals(targetUrl)) {
                     showSportsOverlay();
+                } else if ("brave://movies".equals(targetUrl)) {
+                    showMoviesOverlay();
                 } else {
                     loadTarget(targetUrl);
                     hideTopBar();
@@ -1074,6 +1649,10 @@ public final class MainActivity extends Activity {
             showSportsOverlay();
             return;
         }
+        if (q.equalsIgnoreCase("brave://movies")) {
+            showMoviesOverlay();
+            return;
+        }
         inSportsStreamMode = false;
         if (q.isEmpty() || q.equalsIgnoreCase("brave://home") || q.equalsIgnoreCase("youtube")) {
             q = YT_TV_URL;
@@ -1112,9 +1691,20 @@ public final class MainActivity extends Activity {
         if (key == KeyEvent.KEYCODE_MENU || (key == KeyEvent.KEYCODE_BACK && event.isLongPress())) {
             if (action == KeyEvent.ACTION_DOWN) {
                 if (sportsVisible) hideSportsOverlay();
+                if (moviesVisible) hideMoviesOverlay();
                 if (barVisible) hideTopBar(); else showTopBar();
             }
             return true;
+        }
+
+        // When Movies Hub overlay is open, D-pad navigates movie & server cards natively
+        if (moviesVisible) {
+            if (key == KeyEvent.KEYCODE_BACK && action == KeyEvent.ACTION_DOWN) {
+                hideMoviesOverlay();
+                showTopBar();
+                return true;
+            }
+            return super.dispatchKeyEvent(event);
         }
 
         // When Live Sports Hub overlay is open, D-pad navigates match & server cards natively
