@@ -70,6 +70,9 @@ public final class MainActivity extends Activity {
     private boolean sportsVisible = false;
     private boolean inSportsStreamMode = false;
     private volatile String activeStreamHost = "";
+    private volatile String lastRequestedUrl = YT_TV_URL;
+    private volatile boolean mainFrameError = false;
+    private long backgroundedAtMs = 0;
     private final ExecutorService bgExecutor = Executors.newCachedThreadPool();
 
     // Native Movies & Series Cinema Hub Overlay (Goojara + VidSrc + 2Embed + MultiEmbed)
@@ -300,7 +303,37 @@ public final class MainActivity extends Activity {
         setIntent(intent);
         if (intent != null && intent.getDataString() != null) {
             loadTarget(intent.getDataString());
+        } else {
+            String cur = webView != null ? webView.getUrl() : null;
+            boolean expiredSession = backgroundedAtMs > 0 && (SystemClock.uptimeMillis() - backgroundedAtMs > 120_000);
+            if (mainFrameError || cur == null || cur.isEmpty() || cur.startsWith("about:") ||
+                cur.startsWith("chrome-error:") || cur.startsWith("data:") ||
+                (inSportsStreamMode && expiredSession)) {
+                loadTarget(YT_TV_URL);
+            }
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) {
+            webView.onResume();
+            webView.resumeTimers();
+            String cur = webView.getUrl();
+            boolean expiredSession = backgroundedAtMs > 0 && (SystemClock.uptimeMillis() - backgroundedAtMs > 300_000);
+            if (mainFrameError || cur == null || cur.isEmpty() || cur.startsWith("about:") ||
+                cur.startsWith("chrome-error:") || (inSportsStreamMode && expiredSession)) {
+                loadTarget(lastRequestedUrl != null && !lastRequestedUrl.isEmpty() ? lastRequestedUrl : YT_TV_URL);
+            }
+        }
+        backgroundedAtMs = 0;
+    }
+
+    @Override
+    protected void onStop() {
+        backgroundedAtMs = SystemClock.uptimeMillis();
+        super.onStop();
     }
 
     @SuppressWarnings("SetJavaScriptEnabled")
@@ -309,6 +342,7 @@ public final class MainActivity extends Activity {
         webView.setBackgroundColor(0xFF0B0D13);
         webView.setFocusable(true);
         webView.setFocusableInTouchMode(true);
+        webView.setSoundEffectsEnabled(false);
 
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
@@ -370,7 +404,10 @@ public final class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
-                urlInput.setText(url);
+                if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    mainFrameError = false;
+                    if (urlInput != null) urlInput.setText(url);
+                }
                 syncModeForUrl(url);
                 if (shieldsEnabled) view.evaluateJavascript(BRAVE_YT_SHIELD_JS, null);
                 handler.postDelayed(() -> {
@@ -392,6 +429,39 @@ public final class MainActivity extends Activity {
                 }
                 injectViewportFit(url);
                 updateShieldPill();
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest req, WebResourceError err) {
+                super.onReceivedError(view, req, err);
+                if (req != null && req.isForMainFrame()) {
+                    mainFrameError = true;
+                    final String retryUrl = (lastRequestedUrl != null && !lastRequestedUrl.isEmpty())
+                        ? lastRequestedUrl
+                        : YT_TV_URL;
+                    handler.postDelayed(() -> {
+                        if (mainFrameError && webView != null) {
+                            loadTarget(retryUrl);
+                        }
+                    }, 2200);
+                }
+            }
+
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                if (root != null && webView != null) {
+                    try {
+                        root.removeView(webView);
+                        webView.destroy();
+                    } catch (Throwable ignored) {}
+                }
+                createWebView();
+                if (root != null && webView.getParent() != null) {
+                    root.removeView(webView);
+                    root.addView(webView, 0, new FrameLayout.LayoutParams(-1, -1));
+                }
+                loadTarget(lastRequestedUrl != null ? lastRequestedUrl : YT_TV_URL);
+                return true;
             }
         });
 
@@ -1654,6 +1724,7 @@ public final class MainActivity extends Activity {
             return;
         }
         inSportsStreamMode = false;
+        activeStreamHost = "";
         if (q.isEmpty() || q.equalsIgnoreCase("brave://home") || q.equalsIgnoreCase("youtube")) {
             q = YT_TV_URL;
         }
@@ -1665,6 +1736,7 @@ public final class MainActivity extends Activity {
         } else {
             url = "https://search.brave.com/search?q=" + Uri.encode(q);
         }
+        lastRequestedUrl = url;
         boolean ytTv = url.contains("youtube.com/tv") || url.contains("youtube.com/leanback");
         webView.getSettings().setUserAgentString(ytTv ? SMART_TV_UA : DESKTOP_UA);
         syncModeForUrl(url);
